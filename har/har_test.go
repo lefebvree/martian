@@ -84,8 +84,8 @@ func TestModifyRequest(t *testing.T) {
 		t.Errorf("hreq.BodySize: got %d, want %d", got, want)
 	}
 
-	if got, want := hreq.HeadersSize, int64(-1); got != want {
-		t.Errorf("hreq.HeadersSize: got %d, want %d", got, want)
+	if got, want := hreq.HeadersSize, int64(0); got <= want {
+		t.Errorf("hreq.HeadersSize: got %d, want more than %d", got, want)
 	}
 
 	if got, want := len(hreq.QueryString), 1; got != want {

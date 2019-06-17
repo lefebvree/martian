@@ -20,6 +20,7 @@ package har
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -91,7 +93,11 @@ type Entry struct {
 	// Timings describes various phases within request-response round trip. All
 	// times are specified in milliseconds.
 	Timings *Timings `json:"timings"`
-	next    *Entry
+	// ServerIPAddress describes the IP address of the server that was connected
+	// (result of DNS resolution).
+	ServerIPAddress string `json:"serverIPAddress"`
+
+	next *Entry
 }
 
 // Request holds data about an individual HTTP request.
@@ -159,6 +165,14 @@ type Timings struct {
 	Wait int64 `json:"wait"`
 	// Receive is the time required to read entire response from server or cache.
 	Receive int64 `json:"receive"`
+	// Blocked is the time spent in a queue waiting for a network connection, -1 if doesnt apply.
+	Blocked int64 `json:"blocked"`
+	// DNS is the time required to resolve a host name, -1 if doesnt apply.
+	DNS int64 `json:"dns"`
+	// Connect is the time required to create a TCP connection, -1 if doesnt apply.
+	Connect int64 `json:"connect"`
+	// SSL is the time required for SSL/TLS negotiation, -1 if doesnt apply.
+	SSL int64 `json:"ssl"`
 }
 
 // Cookie is the data about a cookie on a request or response.
@@ -421,18 +435,20 @@ func (l *Logger) ModifyRequest(req *http.Request) error {
 // RecordRequest logs the HTTP request with the given ID. The ID should be unique
 // per request/response pair.
 func (l *Logger) RecordRequest(id string, req *http.Request) error {
+
+	entry := &Entry{
+		ID:      id,
+		Cache:   &Cache{},
+		Time:    -1,
+		Timings: NewTimings(),
+	}
+
+	l.RecordRequestTrace(id, req)
 	hreq, err := NewRequest(req, l.postDataLogging(req))
 	if err != nil {
 		return err
 	}
-
-	entry := &Entry{
-		ID:              id,
-		StartedDateTime: time.Now().UTC(),
-		Request:         hreq,
-		Cache:           &Cache{},
-		Timings:         &Timings{},
-	}
+	entry.Request = hreq
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -451,6 +467,110 @@ func (l *Logger) RecordRequest(id string, req *http.Request) error {
 	return nil
 }
 
+// NewTimings return a Timings initialized with default values.
+func NewTimings() *Timings {
+	return &Timings{
+		Send:    0,
+		Wait:    0,
+		Receive: 0,
+		Blocked: -1,
+		DNS:     -1,
+		Connect: -1,
+		SSL:     -1,
+	}
+}
+
+// timingBetween returns the  number of milliseconds between start and end times.
+func timingBetween(start, end time.Time) int64 {
+	return end.Sub(start).Nanoseconds() / 1e6
+}
+
+// RecordRequestTrace change context of request to log timings and server IP with httptrace.
+func (l *Logger) RecordRequestTrace(id string, req *http.Request) {
+	timings := NewTimings()
+	var serverIp string
+	// t keeps track of request times
+	t := struct {
+		start,
+		dnsStart,
+		dnsDone,
+		connectStart,
+		tlsStart,
+		reqSent,
+		gotConn,
+		resStart,
+		resEnd time.Time
+	}{}
+
+	*req = *req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GetConn: func(_ string) {
+			t.start = time.Now()
+		},
+		DNSStart: func(_ httptrace.DNSStartInfo) {
+			t.dnsStart = time.Now()
+		},
+		DNSDone: func(_ httptrace.DNSDoneInfo) {
+			t.dnsDone = time.Now()
+			t.connectStart = t.dnsDone // best indicator of connect start from httptrace
+			timings.DNS = timingBetween(t.dnsStart, t.dnsDone)
+		},
+		TLSHandshakeStart: func() {
+			t.tlsStart = time.Now()
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+			timings.SSL = timingBetween(t.tlsStart, time.Now())
+		},
+		ConnectStart: func(_, _ string) {
+			t.connectStart = time.Now()
+			timings.Blocked = timingBetween(t.start, t.connectStart)
+		},
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			t.gotConn = time.Now()
+			serverIp = connInfo.Conn.RemoteAddr().String() // Get remote server ip
+		},
+		WroteRequest: func(_ httptrace.WroteRequestInfo) {
+			t.reqSent = time.Now()
+			timings.Send = timingBetween(t.gotConn, t.reqSent)
+		},
+		GotFirstResponseByte: func() {
+			t.resStart = time.Now()
+			timings.Wait = timingBetween(t.reqSent, t.resStart)
+		},
+		PutIdleConn: func(_ error) {
+			t.resEnd = time.Now()
+
+			// Total request + response time
+			total := timingBetween(t.start, t.resEnd)
+
+			timings.Receive = timingBetween(t.resStart, t.resEnd)
+			if !t.connectStart.IsZero() {
+				timings.Connect = timingBetween(t.connectStart, t.gotConn)
+			} else {
+				// following HAR 1.2 spec : time == blocked + dns + connect + send + wait + receive
+				// Blocked and Connect are not traced with proxy, by default we attribute total difference
+				// (total - sum of other t) to Connect
+				sum := timings.Send + timings.Wait + timings.Receive
+				if timings.DNS != -1 { // ignore DNS time if not set
+					sum += timings.DNS
+				}
+				if total > sum {
+					timings.Connect = total - sum
+				}
+			}
+
+			l.mu.Lock()
+			defer l.mu.Unlock()
+
+			if e, ok := l.entries[id]; ok {
+				e.ServerIPAddress = serverIp
+				e.StartedDateTime = t.start.UTC()
+				e.Time = total
+				e.Timings = timings
+			}
+		},
+	}))
+}
+
 // NewRequest constructs and returns a Request from req. If withBody is true,
 // req.Body is read to EOF and replaced with a copy in a bytes.Buffer. An error
 // is returned (and req.Body may be in an intermediate state) if an error is
@@ -466,6 +586,17 @@ func NewRequest(req *http.Request, withBody bool) (*Request, error) {
 		Headers:     headers(proxyutil.RequestHeader(req).Map()),
 		Cookies:     cookies(req.Cookies()),
 	}
+
+	mv := messageview.New()
+	if err := mv.SnapshotRequest(req); err != nil {
+		return nil, err
+	}
+	hr := mv.HeaderReader()
+	header, err := ioutil.ReadAll(hr)
+	if err != nil {
+		return nil, err
+	}
+	r.HeadersSize = int64(len(header))
 
 	for n, vs := range req.URL.Query() {
 		for _, v := range vs {
@@ -509,7 +640,6 @@ func (l *Logger) RecordResponse(id string, res *http.Response) error {
 
 	if e, ok := l.entries[id]; ok {
 		e.Response = hres
-		e.Time = time.Since(e.StartedDateTime).Nanoseconds() / 1000000
 	}
 
 	return nil
@@ -557,6 +687,21 @@ func NewResponse(res *http.Response, withBody bool) (*Response, error) {
 
 		r.Content.Text = body
 		r.Content.Size = int64(len(body))
+		// Length of the returned content in bytes.
+		// Should be equal to response.bodySize if there is no compression
+		// and bigger when the content has been compressed
+		if r.BodySize <= 0 && r.Content.Size > 0 {
+			r.BodySize = r.Content.Size
+		}
+
+		hr := mv.HeaderReader()
+		header, err := ioutil.ReadAll(hr)
+		if err != nil {
+			return nil, err
+		}
+		// Total number of bytes from the start of the HTTP response message until
+		// (and including) the double CRLF before the body
+		r.HeadersSize = int64(len(header))
 	}
 	return r, nil
 }
