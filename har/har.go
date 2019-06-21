@@ -27,6 +27,7 @@ import (
 	"io/ioutil"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -526,7 +527,11 @@ func (l *Logger) RecordRequestTrace(id string, req *http.Request) {
 		},
 		GotConn: func(connInfo httptrace.GotConnInfo) {
 			t.gotConn = time.Now()
+
 			serverIp = connInfo.Conn.RemoteAddr().String() // Get remote server ip
+			if addr, _, err := net.SplitHostPort(serverIp); err == nil { // Remove port if any
+				serverIp = addr
+			}
 		},
 		WroteRequest: func(_ httptrace.WroteRequestInfo) {
 			t.reqSent = time.Now()
